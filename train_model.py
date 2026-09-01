@@ -138,30 +138,46 @@ def train(dataset_dir: Path, out_dir: Path):
     print(f"  {len(df)} runs cargadas, {len(feature_cols)} parámetros como features.")
 
     X = df[feature_cols].fillna(df[feature_cols].median())
-    y_pop = df[TARGET_POP_COL]
-    y_instability = df[TARGET_STABILITY_COL]
     y_extinct = df[TARGET_EXTINCT_COL]
 
-    X_train, X_test, ypop_train, ypop_test, yins_train, yins_test, yext_train, yext_test = train_test_split(
-        X, y_pop, y_instability, y_extinct, test_size=0.2, random_state=42
+    # El clasificador de extinción ve TODAS las runs (extintas y vivas).
+    X_train, X_test, yext_train, yext_test = train_test_split(
+        X, y_extinct, test_size=0.2, random_state=42, stratify=y_extinct if y_extinct.nunique() > 1 else None
     )
-
-    pop_model = RandomForestRegressor(n_estimators=150, max_depth=14, min_samples_leaf=3, random_state=42, n_jobs=2)
-    pop_model.fit(X_train, ypop_train)
-
-    instability_model = RandomForestRegressor(n_estimators=100, max_depth=14, min_samples_leaf=3, random_state=42, n_jobs=2)
-    instability_model.fit(X_train, yins_train)
-
     extinct_model = RandomForestClassifier(n_estimators=100, max_depth=14, min_samples_leaf=3, random_state=42, n_jobs=2, class_weight="balanced")
     extinct_model.fit(X_train, yext_train)
 
-    pop_pred = pop_model.predict(X_test)
+    # Los regresores de "población estable" e "inestabilidad" solo tienen
+    # sentido para runs que sobrevivieron: una run extinta no se "estabilizó"
+    # en 0, simplemente murió. Mezclarlas ensucia el target de regresión.
+    alive_df = df[df[TARGET_EXTINCT_COL] == 0]
+    n_dropped = len(df) - len(alive_df)
+    if n_dropped:
+        print(f"  {n_dropped} runs extintas excluidas de los regresores de población/inestabilidad (siguen usándose para el clasificador de extinción).")
+    if len(alive_df) < 20:
+        print("  ! aviso: quedan muy pocas runs vivas para entrenar los regresores con fiabilidad.", file=sys.stderr)
+
+    X_alive = alive_df[feature_cols].fillna(df[feature_cols].median())
+    y_pop = alive_df[TARGET_POP_COL]
+    y_instability = alive_df[TARGET_STABILITY_COL]
+
+    Xa_train, Xa_test, ypop_train, ypop_test, yins_train, yins_test = train_test_split(
+        X_alive, y_pop, y_instability, test_size=0.2, random_state=42
+    )
+
+    pop_model = RandomForestRegressor(n_estimators=150, max_depth=14, min_samples_leaf=3, random_state=42, n_jobs=2)
+    pop_model.fit(Xa_train, ypop_train)
+
+    instability_model = RandomForestRegressor(n_estimators=100, max_depth=14, min_samples_leaf=3, random_state=42, n_jobs=2)
+    instability_model.fit(Xa_train, yins_train)
+
+    pop_pred = pop_model.predict(Xa_test)
     print("\n=== Validación (20% held-out) ===")
-    print(f"  Población estable  -> MAE={mean_absolute_error(ypop_test, pop_pred):.1f}  R2={r2_score(ypop_test, pop_pred):.3f}")
+    print(f"  Población estable  -> MAE={mean_absolute_error(ypop_test, pop_pred):.1f}  R2={r2_score(ypop_test, pop_pred):.3f}  (solo runs vivas, n={len(alive_df)})")
     if yext_test.nunique() > 1:
         ext_pred = extinct_model.predict(X_test)
-        print(f"  Extinción           -> accuracy={accuracy_score(yext_test, ext_pred):.3f}")
-    ins_pred = instability_model.predict(X_test)
+        print(f"  Extinción           -> accuracy={accuracy_score(yext_test, ext_pred):.3f}  (todas las runs, n={len(df)})")
+    ins_pred = instability_model.predict(Xa_test)
     print(f"  Inestabilidad (CV)  -> MAE={mean_absolute_error(yins_test, ins_pred):.3f}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -200,7 +216,7 @@ def evaluate(model_dir: Path):
 # ============================================================
 # 4. SUGERENCIA DE PARÁMETROS PARA UN OBJETIVO
 # ============================================================
-def suggest(model_dir: Path, target_population: float, max_instability: float, fixed: dict):
+def suggest(model_dir: Path, target_population: float, max_instability: float, fixed: dict, maxiter: int, popsize: int, workers: int):
     bundle = joblib.load(model_dir / "model.joblib")
     feature_cols = bundle["feature_cols"]
     bounds = bundle["bounds"]
@@ -214,20 +230,30 @@ def suggest(model_dir: Path, target_population: float, max_instability: float, f
 
     free_cols = [c for c in feature_cols if c not in fixed]
     search_bounds = [bounds[c] for c in free_cols]
+    fixed_idx = [feature_cols.index(c) for c in fixed]
+    fixed_vals = [fixed[c] for c in fixed]
+    free_idx = [feature_cols.index(c) for c in free_cols]
 
-    def build_row(x):
-        values = dict(zip(free_cols, x))
-        values.update(fixed)
-        return pd.DataFrame([[values[c] for c in feature_cols]], columns=feature_cols)
+    def build_rows(X: np.ndarray) -> pd.DataFrame:
+        # X llega como (n_free_params, n_candidatos) desde differential_evolution
+        # con vectorized=True. Montamos una matriz (n_candidatos, n_features).
+        n_candidates = X.shape[1]
+        full = np.empty((n_candidates, len(feature_cols)))
+        full[:, free_idx] = X.T
+        if fixed_idx:
+            full[:, fixed_idx] = fixed_vals
+        return pd.DataFrame(full, columns=feature_cols)
 
-    def objective(x):
-        row = build_row(x)
-        pred_pop = pop_model.predict(row)[0]
-        pred_instability = instability_model.predict(row)[0]
-        pred_extinct_prob = extinct_model.predict_proba(row)[0][1] if hasattr(extinct_model, "predict_proba") else 0.0
+    def objective(X: np.ndarray) -> np.ndarray:
+        # Evalúa TODOS los candidatos de la generación en una sola pasada
+        # por cada modelo (mucho más rápido que fila a fila).
+        rows = build_rows(X)
+        pred_pop = pop_model.predict(rows)
+        pred_instability = instability_model.predict(rows)
+        pred_extinct_prob = _extinct_probability(extinct_model, rows)
 
         error = (pred_pop - target_population) ** 2
-        instability_penalty = 200.0 * max(0.0, pred_instability - max_instability)
+        instability_penalty = 200.0 * np.clip(pred_instability - max_instability, 0, None)
         extinction_penalty = 5000.0 * pred_extinct_prob
         return error + instability_penalty + extinction_penalty
 
@@ -235,16 +261,19 @@ def suggest(model_dir: Path, target_population: float, max_instability: float, f
         objective,
         bounds=search_bounds,
         seed=42,
-        maxiter=200,
+        maxiter=maxiter,
+        popsize=popsize,
         tol=1e-6,
-        polish=True
-        
+        polish=True,
+        vectorized=True,
+        updating="deferred",  # requerido por vectorized=True
+        workers=1,  # vectorized ya paraleliza "de golpe"; no combinar con workers>1
     )
 
-    best_row = build_row(result.x)
+    best_row = build_rows(result.x.reshape(-1, 1))
     pred_pop = pop_model.predict(best_row)[0]
     pred_instability = instability_model.predict(best_row)[0]
-    pred_extinct_prob = extinct_model.predict_proba(best_row)[0][1] if hasattr(extinct_model, "predict_proba") else 0.0
+    pred_extinct_prob = _extinct_probability(extinct_model, best_row)[0]
 
     print(f"\nObjetivo: población estable ≈ {target_population}\n")
     print("Parámetros sugeridos:")
@@ -263,6 +292,17 @@ def suggest(model_dir: Path, target_population: float, max_instability: float, f
     )
 
     return {c: float(best_row[c].iloc[0]) for c in feature_cols}
+
+
+def _extinct_probability(extinct_model, rows: pd.DataFrame) -> np.ndarray:
+    """Prob. de clase 'extinct=1', robusto a cuando el modelo solo vio una clase en entrenamiento."""
+    if not hasattr(extinct_model, "predict_proba"):
+        return np.zeros(len(rows))
+    proba = extinct_model.predict_proba(rows)
+    classes = list(extinct_model.classes_)
+    if 1 in classes:
+        return proba[:, classes.index(1)]
+    return np.zeros(len(rows))  # el modelo nunca vio extinciones en entrenamiento
 
 
 # ============================================================
@@ -287,7 +327,7 @@ def predict(model_dir: Path, overrides: dict):
 
     pred_pop = pop_model.predict(row)[0]
     pred_instability = instability_model.predict(row)[0]
-    pred_extinct_prob = extinct_model.predict_proba(row)[0][1] if hasattr(extinct_model, "predict_proba") else 0.0
+    pred_extinct_prob = _extinct_probability(extinct_model, row)[0]
 
     missing = [c for c in feature_cols if c not in overrides]
     if missing:
@@ -308,6 +348,89 @@ def predict(model_dir: Path, overrides: dict):
         "predicted_instability": float(pred_instability),
         "predicted_extinction_probability": float(pred_extinct_prob),
     }
+
+
+# ============================================================
+# 5. MUESTREO GUIADO: usar el clasificador de extinción para
+#    proponer combinaciones que probablemente sobrevivan, en vez
+#    de muestrear el espacio de parámetros a ciegas.
+# ============================================================
+# Mismos pares min/max que ALL_PARAM_RANGES en batch-simulate.mjs,
+# para no generar combinaciones degeneradas (p. ej. MIN_RADIUS > MAX_RADIUS).
+MIN_MAX_PAIRS = [
+    ("INITIAL_LIFESPAN_MIN", "INITIAL_LIFESPAN_MAX"),
+    ("INITIAL_ENERGY_MIN", "INITIAL_ENERGY_MAX"),
+    ("MIN_RADIUS", "MAX_RADIUS"),
+    ("INITIAL_RADIUS_MIN", "INITIAL_RADIUS_MAX"),
+]
+INTEGER_PARAM_KEYS = {"INITIAL_PARTICLES", "MAX_PARTICLES", "MAX_DECISION_NEARBY"}
+
+
+def _random_pool(feature_cols, bounds, pool_size, rng):
+    pool = np.empty((pool_size, len(feature_cols)))
+    for j, col in enumerate(feature_cols):
+        lo, hi = bounds[col]
+        pool[:, j] = rng.uniform(lo, hi, size=pool_size)
+
+    df = pd.DataFrame(pool, columns=feature_cols)
+
+    for min_key, max_key in MIN_MAX_PAIRS:
+        if min_key in df.columns and max_key in df.columns:
+            lo = df[[min_key, max_key]].min(axis=1)
+            hi = df[[min_key, max_key]].max(axis=1)
+            df[min_key], df[max_key] = lo, hi
+
+    if "INITIAL_PARTICLES" in df.columns and "MAX_PARTICLES" in df.columns:
+        df["MAX_PARTICLES"] = np.maximum(df["MAX_PARTICLES"], np.ceil(df["INITIAL_PARTICLES"] * 1.5))
+
+    for col in INTEGER_PARAM_KEYS & set(df.columns):
+        df[col] = df[col].round()
+
+    return df
+
+
+def sample_survivable(model_dir: Path, count: int, pool_multiplier: int, max_extinction_prob: float, out_path: Path, seed: int):
+    bundle = joblib.load(model_dir / "model.joblib")
+    feature_cols = bundle["feature_cols"]
+    bounds = bundle["bounds"]
+    extinct_model = bundle["extinct_model"]
+
+    rng = np.random.default_rng(seed)
+    pool_size = count * pool_multiplier
+    print(f"Generando {pool_size} combinaciones candidatas dentro de los rangos vistos en el dataset ...")
+    pool_df = _random_pool(feature_cols, bounds, pool_size, rng)
+
+    extinct_prob = _extinct_probability(extinct_model, pool_df)
+    pool_df["_predicted_extinction_probability"] = extinct_prob
+
+    survivable = pool_df[pool_df["_predicted_extinction_probability"] <= max_extinction_prob].copy()
+    survivable = survivable.sort_values("_predicted_extinction_probability")
+
+    if len(survivable) < count:
+        print(
+            f"  ! solo {len(survivable)} candidatos por debajo de {max_extinction_prob:.0%} de prob. de extinción "
+            f"(de {pool_size} generados). Completo con los de menor probabilidad aunque superen el umbral.",
+            file=sys.stderr,
+        )
+        remaining = pool_df.sort_values("_predicted_extinction_probability")
+        survivable = remaining.head(count)
+    else:
+        survivable = survivable.head(count)
+
+    print(
+        f"  {len(survivable)} combinaciones seleccionadas. "
+        f"Prob. de extinción predicha: media={survivable['_predicted_extinction_probability'].mean():.1%}, "
+        f"máx={survivable['_predicted_extinction_probability'].max():.1%}"
+    )
+
+    combos = survivable[feature_cols].to_dict(orient="records")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(combos, indent=2))
+    print(f"\nGuardado en {out_path}")
+    print(
+        "Úsalo con batch-simulate.mjs así:\n"
+        f"  node batch-simulate.mjs --combos-file {out_path} --seconds-per-run <N> --out ./dataset-round2"
+    )
 
 
 # ============================================================
@@ -332,6 +455,8 @@ def main():
         "--fix", action="append", default=[], metavar="KEY=VALUE",
         help="Fija un parámetro a un valor concreto en la búsqueda (repetible)",
     )
+    p_suggest.add_argument("--maxiter", type=int, default=60, help="Generaciones de la búsqueda (default 60, antes 200 — bájalo si va lento)")
+    p_suggest.add_argument("--popsize", type=int, default=15, help="Candidatos por parámetro y generación (default 15)")
 
     p_predict = sub.add_parser("predict", help="Predice el resultado de una combinación de parámetros concreta")
     p_predict.add_argument("--model", type=Path, required=True)
@@ -339,6 +464,17 @@ def main():
         "--param", action="append", default=[], metavar="KEY=VALUE",
         help="Parámetro a fijar para la predicción (repetible; el resto usa el punto medio del rango visto en el dataset)",
     )
+
+    p_sample = sub.add_parser(
+        "sample-survivable",
+        help="Genera combinaciones de parámetros que el clasificador de extinción predice viables, para simular una 2ª ronda",
+    )
+    p_sample.add_argument("--model", type=Path, required=True)
+    p_sample.add_argument("--count", type=int, default=500, help="Nº de combinaciones a devolver (default 500)")
+    p_sample.add_argument("--pool-multiplier", type=int, default=20, help="Candidatos generados por cada uno devuelto, antes de filtrar (default 20)")
+    p_sample.add_argument("--max-extinction-prob", type=float, default=0.3, help="Umbral de prob. de extinción predicha para aceptar un candidato (default 0.3)")
+    p_sample.add_argument("--out", type=Path, default=Path("./combos.json"))
+    p_sample.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
@@ -351,13 +487,15 @@ def main():
         for item in args.fix:
             key, value = item.split("=")
             fixed[key] = float(value)
-        suggest(args.model, args.target_population, args.max_instability, fixed)
+        suggest(args.model, args.target_population, args.max_instability, fixed, args.maxiter, args.popsize, 1)
     elif args.command == "predict":
         overrides = {}
         for item in args.param:
             key, value = item.split("=")
             overrides[key] = float(value)
         predict(args.model, overrides)
+    elif args.command == "sample-survivable":
+        sample_survivable(args.model, args.count, args.pool_multiplier, args.max_extinction_prob, args.out, args.seed)
 
 
 if __name__ == "__main__":
