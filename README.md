@@ -1,5 +1,8 @@
 # Particle-Life: simulación headless + dataset + modelo de predicción
 
+Puedes consultar y explorar los datos generados por este repositorio a través del [Explorador de Gráficas de AI-Simulation](https://jaimeromangil.com)
+
+
 Pipeline para correr la simulación de partículas fuera del navegador, generar
 un dataset de miles de corridas con distintos parámetros, entrenar un modelo
 que aprenda la relación *parámetros → resultado*, y usarlo para predecir o
