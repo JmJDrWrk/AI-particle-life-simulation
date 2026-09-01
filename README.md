@@ -260,7 +260,11 @@ archivos** (arrastrar y soltar o seleccionar) y compararlos:
 Ahora podremos practicar el 'active learning'
 
 # Ronda 1: a ciegas, para entrenar el clasificador
-node batch-simulate.mjs --mode random --all-params --samples 500 --seconds-per-run 900 --out ./ds/A
+node batch-simulate.mjs --mode random --all-params --samples 500 --seconds-per-run 300 --out ./ds/A
+node batch-simulate.mjs --mode random --all-params --samples 500 --seconds-per-run 300 --out ./ds/B
+node batch-simulate.mjs --mode random --all-params --samples 500 --seconds-per-run 300 --out ./ds/C
+node batch-simulate.mjs --mode random --all-params --samples 500 --seconds-per-run 300 --out ./ds/D
+
 python train_model.py train --dataset ./ds/A --out ./model
 
 # Ronda 2: la IA propone combinaciones que probablemente sobrevivan

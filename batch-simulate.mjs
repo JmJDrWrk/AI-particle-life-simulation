@@ -264,8 +264,11 @@ function runOne(runId, paramOverrides, args) {
             lastSummary = state.elapsed;
             timeseries.push(summarize(state));
         }
-        
-        if (state.particles.length > MAX_PART_SEC_LIMIT) break;
+
+        if (state.particles.length > MAX_PART_SEC_LIMIT) {
+            // console.log('[MAX_PART_SEC_LIMIT] = 2500 rule jumped!!')
+            break;
+        }
 
         if (state.particles.length === 0) break;
     }
@@ -325,18 +328,27 @@ function main() {
         console.log(`\n[${i + 1}/${combos.length}] corrida ${runId} — overrides: ${JSON.stringify(combos[i])}`);
 
         const result = runOne(runId, combos[i], args);
-        const runPath = path.join(runsDir, `run-${runId}.json`);
+
+        let fileName = `run-${runId}.json`;
+        if (result.finalPopulation >= MAX_PART_SEC_LIMIT) {
+            console.warn('Skip write due to "too many particles to simulate!"')
+            fileName = `broke-run-${runId}.json`;
+        }
+
+        let filePath = `runs/${fileName}`;
+        const runPath = path.join(runsDir, fileName);
         fs.writeFileSync(runPath, JSON.stringify(result));
 
         manifest.runs.push({
             runId,
-            file: `runs/run-${runId}.json`,
+            file: filePath,
             overrides: combos[i],
             finalPopulation: result.finalPopulation,
             extinct: result.extinct,
             secondsSimulated: result.secondsSimulated,
             realSeconds: result.realSeconds,
         });
+
         fs.writeFileSync(path.join(args.out, "manifest.json"), JSON.stringify(manifest, null, 2));
         // MinioStorage.saveJson(
         //     `${args.dataset}/runs/run-${runId}.json`,
@@ -348,6 +360,8 @@ function main() {
             `  -> población final=${result.finalPopulation} | nacimientos=${result.totalBirths} | ` +
             `muertes=${result.totalDeaths} | real=${result.realSeconds.toFixed(1)}s`,
         );
+
+
     }
 
     manifest.finishedAt = new Date().toISOString();
