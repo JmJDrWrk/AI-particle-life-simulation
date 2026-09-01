@@ -252,3 +252,19 @@ archivos** (arrastrar y soltar o seleccionar) y compararlos:
 3. **Explorar**: `train_model.py evaluate` para ver qué parámetros importan; `predict`/`suggest` para probar hipótesis sin simular.
 4. **Verificar**: correr `batch-simulate.mjs --runs 10` (modo `repeat`) con los parámetros sugeridos, y comparar la población real contra la predicción.
 5. **Visualizar**: cargar las runs de verificación en `page.tsx` para inspeccionarlas gráficamente.
+
+
+
+## Actualización!!
+
+Ahora podremos practicar el 'active learning'
+
+# Ronda 1: a ciegas, para entrenar el clasificador
+node batch-simulate.mjs --mode random --all-params --samples 500 --seconds-per-run 900 --out ./ds/A
+python train_model.py train --dataset ./ds/A --out ./model
+
+# Ronda 2: la IA propone combinaciones que probablemente sobrevivan
+python train_model.py sample-survivable --model ./model --count 500 \
+  --pool-multiplier 20 --max-extinction-prob 0.3 --out ./combos.json
+
+node batch-simulate.mjs --combos-file ./combos.json --seconds-per-run 900 --out ./ds/A-r-2
