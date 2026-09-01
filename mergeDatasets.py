@@ -5,7 +5,7 @@ import glob
 def merge_runs():
     base_dir = './ds'
     # Las carpetas en el orden que quieres que se unan
-    source_folders = ['A', 'B', 'C', 'D'] 
+    source_folders = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'] 
     merge_dir = os.path.join(base_dir, 'merge')
 
     # 1. Vaciar o crear la carpeta merge
