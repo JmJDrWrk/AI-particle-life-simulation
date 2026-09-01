@@ -41,6 +41,10 @@
  *    varianza dado que hay aleatoriedad en la simulación)
  *    node batch-simulate.mjs --runs 20 --seconds-per-run 600
  *
+ * 4) FILE: usa combinaciones ya elegidas por fuera (p. ej. por
+ *    `train_model.py sample-survivable`) en vez de generarlas aquí:
+ *    node batch-simulate.mjs --combos-file ./combos.json --seconds-per-run 900
+ *
  * ---------------- CONTROL DE DURACIÓN ----------------
  *   --hours N        deja de lanzar corridas nuevas tras N horas reales
  *                     (la corrida en curso SÍ se completa)
@@ -130,6 +134,7 @@ function parseArgs(argv) {
         hours: null,
         fullSnapshot: false,
         allParams: false,
+        combosFile: null,
         gridSpecs: [],
         randomSpecs: [],
         baseOverrides: {},
@@ -147,6 +152,7 @@ function parseArgs(argv) {
         else if (a === "--hours") args.hours = Number(argv[++i]);
         else if (a === "--full-snapshot") args.fullSnapshot = true;
         else if (a === "--all-params") args.allParams = true;
+        else if (a === "--combos-file") args.combosFile = argv[++i];
         else if (a === "--grid") args.gridSpecs.push(argv[++i]);
         else if (a === "--random") args.randomSpecs.push(argv[++i]);
         else if (a === "--param") {
@@ -209,6 +215,17 @@ function randomCombo(specs, { allParams } = {}) {
 }
 
 function buildParamCombos(args) {
+    if (args.combosFile) {
+        console.debug('Using outter config "combosFile" arg')
+        // Combinaciones ya elegidas por fuera (p. ej. por
+        // train_model.py sample-survivable) en vez de generarlas aquí.
+        const raw = fs.readFileSync(args.combosFile, "utf8");
+        const combos = JSON.parse(raw);
+        if (!Array.isArray(combos) || combos.length === 0) {
+            throw new Error(`--combos-file ${args.combosFile} debe contener un array JSON no vacío de objetos {PARAM: valor}.`);
+        }
+        return combos;
+    }
     if (args.mode === "grid") {
         const specs = args.gridSpecs.map(parseGridSpec);
         return cartesianProduct(specs);
@@ -247,7 +264,7 @@ function runOne(runId, paramOverrides, args) {
             lastSummary = state.elapsed;
             timeseries.push(summarize(state));
         }
-
+        
         if (state.particles.length > MAX_PART_SEC_LIMIT) break;
 
         if (state.particles.length === 0) break;
@@ -283,7 +300,8 @@ function main() {
     const combos = buildParamCombos(args);
     const deadlineMs = args.hours ? Date.now() + args.hours * 3600 * 1000 : null;
 
-    console.log(`Modo: ${args.mode}. Corridas planeadas: ${combos.length}. ${args.hours ? `Límite: ${args.hours}h reales.` : ""}`);
+    const modeLabel = args.combosFile ? `file (${args.combosFile})` : args.mode;
+    console.log(`Modo: ${modeLabel}. Corridas planeadas: ${combos.length}. ${args.hours ? `Límite: ${args.hours}h reales.` : ""}`);
 
     const manifest = {
         startedAt: new Date().toISOString(),
